@@ -1,23 +1,51 @@
 /*
- * selinux_permissive.c - Runtime SELinux disable for DBY-W09
+ * selinux_permissive.c - Runtime SELinux permissive toggle for DBY-W09
  *
- * Since CONFIG_SECURITY_SELINUX_DEVELOP=n, the kernel hardcodes enforcing=on.
- * This module completely bypasses SELinux without modifying kernel TEXT:
+ * CONFIG_SECURITY_SELINUX_DEVELOP=n causes enforcing_enabled() to be
+ * hardcoded as "return true" by the compiler.  All permissive-mode code
+ * paths are dead-code-eliminated.  This module restores permissive
+ * behaviour by patching five enforcement points at runtime:
  *
- *   1. selinux_state.initialized = 0
- *      → security_compute_av(): goto allow → avd.allowed = 0xFFFFFFFF
- *      → security_compute_validatetrans/bounded_transition/sid: CBZ → return 0
- *      All NEW AVC computations allow everything.
+ *   5 enforcement points — root cause & patch for each
+ *   ──────────────────────────────────────────────────
  *
- *   2. avc_ss_reset() — flush AVC cache
- *      Old cached "deny" entries from before the toggle are evicted.
+ *   1. avc_denied() +0x20    → MOV W0, WZR
+ *      The final "judge" in every permission check.
+ *      Hook → AVC lookup → avc_denied decides grant/deny.
+ *      Permissive should log+tolerate; hardcoded to return -EACCES.
  *
- * Both are pure DATA operations — no kernel text patching needed.
- * All addresses resolved via kallsyms_lookup_name() (KASLR-safe).
+ *   2. security_compute_validatetrans() entry → MOV W0,WZR; RET
+ *      Validates domain transitions on exec().  Returns 0 on success,
+ *      -EPERM on denial.  Permissive should always allow.  Entry patch
+ *      is simplest because this function only validates, no data output.
+ *
+ *   3. security_bounded_transition() entry → MOV W0,WZR; RET
+ *      Same pattern as #2, for bounded (constrained) transitions.
+ *
+ *   4. security_compute_sid() +0x4AC → MOV W21, WZR
+ *      The inlined compute_sid_handle_invalid_context() inside
+ *      security_compute_sid().  When a computed SID is invalid,
+ *      hardcoded to return -EACCES.  Cannot patch function entry
+ *      because security_compute_sid() must output the computed SID.
+ *      Only the "return -EACCES" instruction is patched.
+ *
+ *   5. convert_context() entry → MOV W0,WZR; RET
+ *      Converts security contexts during policy reload
+ *      (magiskpolicy --live triggers this).  Invalid conversions
+ *      return -EINVAL in enforcing; patched to always return 0.
+ *
+ *   6. security_sid_mls_copy() +0x1AC → MOV W22, WZR
+ *      Second inlined copy of convert_context_handle_invalid_context,
+ *      inside security_sid_mls_copy().  Same -EINVAL pattern as #5.
+ *
+ *   All are patched together in a single aarch64_insn_patch_text() call
+ *   (which uses stop_machine).  Every CPU sees either all-old (enforcing)
+ *   or all-new (permissive) — no mixed state window.
+ *   All addresses resolved via kallsyms_lookup_name() — KASLR-safe.
  *
  * Control via sysfs:
- *   echo 1 > /sys/kernel/selinux_permissive/selinux_permissive  # disable
- *   echo 0 > /sys/kernel/selinux_permissive/selinux_permissive  # restore
+ *   echo 1 > /sys/kernel/selinux_permissive/selinux_permissive  # permissive
+ *   echo 0 > /sys/kernel/selinux_permissive/selinux_permissive  # enforcing
  *
  * Build:
  *   source env.sh && cd dby-w09-4.0
@@ -30,63 +58,133 @@
 #include <linux/sysfs.h>
 #include <linux/kallsyms.h>
 
-/* ── selinux_state offsets (verified from decompiled kernel) ────────── */
+/* ── Instruction encodings ───────────────────────────────────────────── */
 
-#define STATE_INIT_OFF   2    /* offset of 'bool initialized'    */
-#define STATE_AVC_OFF    16   /* offset of 'struct selinux_avc *avc' */
+/* avc_denied: MOV W0, #0xFFFFFFF3 → MOV W0, WZR */
+#define INSN_DENY   0x12800180
+#define INSN_ALLOW  0x2A1F03E0
+
+/* Function entry: MOV W0, WZR; RET — makes function always return 0 */
+#define PATCH_ENTRY_RET { 0x2A1F03E0, 0xD65F03C0 }
+
+/* avc_denied: instruction to patch is at +0x20 from entry */
+#define AVC_DENIED_INSN_OFF  0x20
+
+/* ── Patch point descriptor ──────────────────────────────────────────── */
+
+struct patch_point {
+	const char *name;        /* function name, for kallsyms lookup */
+	int insn_offset;         /* offset from function entry, 0 = patch at entry */
+	int insn_count;          /* number of 32-bit instructions */
+	u32 orig[2];             /* original instructions (saved on init) */
+	u32 permissive[2];       /* patched instructions */
+};
 
 /* ── Module state ────────────────────────────────────────────────────── */
 
-static u8  *initialized_ptr;
-static void *avc_ptr;          /* -> selinux_state->avc */
-static u8   saved_initialized;
-static bool disabled;
+static bool permissive;
 
-/* avc_ss_reset: not exported, call by address */
-typedef int (*avc_ss_reset_fn)(void *avc, u32 seqno);
-static avc_ss_reset_fn avc_ss_reset;
+/*
+ * aarch64_insn_patch_text — uses stop_machine() so all CPUs see the
+ * transition atomically (all-old → all-new, never a mix).
+ */
+typedef int (*patch_text_fn)(void *addrs[], u32 insns[], int cnt);
+static patch_text_fn patch_text;
+
+/* ── Patch points ────────────────────────────────────────────────────── */
+
+static struct patch_point patches[] = {
+	{
+		.name        = "avc_denied",
+		.insn_offset = AVC_DENIED_INSN_OFF,  /* +0x20: MOV W0, #-13 → WZR */
+		.insn_count  = 1,
+		.permissive  = { INSN_ALLOW },
+	},
+	{
+		.name        = "security_compute_validatetrans",
+		.insn_offset = 0,                     /* entry → MOV W0,WZR; RET */
+		.insn_count  = 2,
+		.permissive  = PATCH_ENTRY_RET,
+	},
+	{
+		.name        = "security_bounded_transition",
+		.insn_offset = 0,                     /* entry → MOV W0,WZR; RET */
+		.insn_count  = 2,
+		.permissive  = PATCH_ENTRY_RET,
+	},
+	{
+		.name        = "security_compute_sid",
+		.insn_offset = 0x4AC,                 /* +0x4AC: MOV W21, #-13 → WZR
+		                                            (compute_sid_handle_invalid_context) */
+		.insn_count  = 1,
+		.permissive  = { 0x2A1F03F5 },        /* MOV W21, WZR */
+	},
+	{
+		.name        = "convert_context",
+		.insn_offset = 0,                     /* entry → MOV W0,WZR; RET */
+		.insn_count  = 2,
+		.permissive  = PATCH_ENTRY_RET,
+	},
+	{
+		.name        = "security_sid_mls_copy",
+		.insn_offset = 0x1AC,                 /* +0x1AC: MOV W22, #-22 → WZR
+		                                            (convert_context_handle_invalid_context,
+		                                             2nd inlined call site) */
+		.insn_count  = 1,
+		.permissive  = { 0x2A1F03F6 },        /* MOV W22, WZR */
+	},
+};
 
 /* ── Toggle ──────────────────────────────────────────────────────────── */
 
-static void selinux_disable(void)
+static void apply_state(bool to_permissive)
 {
-	saved_initialized = *initialized_ptr;
+	/*
+	 * Collect all address/instruction pairs into a single batch, then
+	 * patch them all inside one stop_machine() call.  Every CPU sees
+	 * either all-old (enforcing) or all-new (permissive).
+	 */
+	void *addrs[12];
+	u32 insns[12];
+	int total = 0;
+	int i;
 
-	/* Disable SELinux enforcement */
-	*initialized_ptr = 0;
+	for (i = 0; i < ARRAY_SIZE(patches) && total < 12; i++) {
+		struct patch_point *p = &patches[i];
+		unsigned long func = kallsyms_lookup_name(p->name);
+		int j;
 
-	/* Flush AVC cache — old cached "deny" entries must be evicted */
-	if (avc_ss_reset)
-		avc_ss_reset(avc_ptr, 0);
+		if (!func) {
+			pr_err("selinux_permissive: %s not found\n", p->name);
+			continue;
+		}
 
-	disabled = true;
-	pr_info("selinux_permissive: SELinux DISABLED\n");
-}
+		for (j = 0; j < p->insn_count; j++) {
+			addrs[total]   = (void *)(func + p->insn_offset + j * 4);
+			insns[total]   = to_permissive ? p->permissive[j] : p->orig[j];
+			total++;
+		}
+	}
 
-static void selinux_restore(void)
-{
-	/* Restore SELinux */
-	*initialized_ptr = saved_initialized;
+	if (total > 0)
+		patch_text(addrs, insns, total);
 
-	/* Flush AVC — clear the "allow-all" entries from permissive period */
-	if (avc_ss_reset)
-		avc_ss_reset(avc_ptr, 0);
-
-	disabled = false;
-	pr_info("selinux_permissive: SELinux ENFORCING (restored)\n");
+	permissive = to_permissive;
+	pr_info("selinux_permissive: SELinux %s (%d insns patched)\n",
+		to_permissive ? "PERMISSIVE" : "ENFORCING", total);
 }
 
 /* ── sysfs interface ─────────────────────────────────────────────────── */
 
-static ssize_t disabled_show(struct kobject *kobj,
-			     struct kobj_attribute *attr, char *buf)
+static ssize_t permissive_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%d\n", disabled);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", permissive);
 }
 
-static ssize_t disabled_store(struct kobject *kobj,
-			      struct kobj_attribute *attr,
-			      const char *buf, size_t count)
+static ssize_t permissive_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
 {
 	int val;
 
@@ -94,16 +192,14 @@ static ssize_t disabled_store(struct kobject *kobj,
 		return -EINVAL;
 
 	val = !!val;
-	if (val && !disabled)
-		selinux_disable();
-	else if (!val && disabled)
-		selinux_restore();
+	if (val != permissive)
+		apply_state(val);
 
 	return count;
 }
 
-static struct kobj_attribute disabled_attr =
-	__ATTR(selinux_permissive, 0644, disabled_show, disabled_store);
+static struct kobj_attribute permissive_attr =
+	__ATTR(selinux_permissive, 0644, permissive_show, permissive_store);
 
 static struct kobject *selinux_kobj;
 
@@ -111,54 +207,56 @@ static struct kobject *selinux_kobj;
 
 static int __init selinux_permissive_init(void)
 {
-	unsigned long selinux_state_addr;
-	int ret;
+	int i, ret;
 
-	/* Resolve addresses via kallsyms (KASLR-safe) */
-	selinux_state_addr = kallsyms_lookup_name("selinux_state");
-	if (!selinux_state_addr) {
-		pr_err("selinux_permissive: selinux_state not found\n");
+	patch_text = (patch_text_fn)kallsyms_lookup_name("aarch64_insn_patch_text");
+	if (!patch_text) {
+		pr_err("selinux_permissive: aarch64_insn_patch_text not found\n");
 		return -ENOENT;
 	}
 
-	initialized_ptr = (u8 *)(selinux_state_addr + STATE_INIT_OFF);
-	avc_ptr = *(void **)(selinux_state_addr + STATE_AVC_OFF);
+	/* Resolve all functions and save original instructions */
+	for (i = 0; i < ARRAY_SIZE(patches); i++) {
+		struct patch_point *p = &patches[i];
+		unsigned long func = kallsyms_lookup_name(p->name);
+		u32 *addr;
 
-	pr_info("selinux_permissive: selinux_state @ %px\n", (void *)selinux_state_addr);
-	pr_info("selinux_permissive: initialized    @ %px = %d\n",
-		initialized_ptr, *initialized_ptr);
-	pr_info("selinux_permissive: avc           @ %px = %px\n",
-		(void *)(selinux_state_addr + STATE_AVC_OFF), avc_ptr);
+		if (!func) {
+			pr_err("selinux_permissive: %s not found\n", p->name);
+			return -ENOENT;
+		}
 
-	/* Resolve avc_ss_reset (not exported to modules, call by address) */
-	avc_ss_reset = (avc_ss_reset_fn)kallsyms_lookup_name("avc_ss_reset");
-	if (!avc_ss_reset)
-		pr_warn("selinux_permissive: avc_ss_reset not found, AVC cache won't be flushed\n");
+		addr = (u32 *)(func + p->insn_offset);
+		memcpy(p->orig, addr, p->insn_count * 4);
 
-	/* Create sysfs entry */
+		pr_info("selinux_permissive: %-40s @ %px  orig=%08x%s\n",
+			p->name, addr, p->orig[0],
+			p->insn_count > 1 ? "..." : "");
+	}
+
 	selinux_kobj = kobject_create_and_add("selinux_permissive", kernel_kobj);
 	if (!selinux_kobj)
 		return -ENOMEM;
 
-	ret = sysfs_create_file(selinux_kobj, &disabled_attr.attr);
+	ret = sysfs_create_file(selinux_kobj, &permissive_attr.attr);
 	if (ret) {
 		kobject_put(selinux_kobj);
 		return ret;
 	}
 
-	pr_info("selinux_permissive: loaded.\n");
-	pr_info("  echo 1 > /sys/kernel/selinux_permissive/selinux_permissive  # disable SELinux\n");
-	pr_info("  echo 0 > /sys/kernel/selinux_permissive/selinux_permissive  # restore SELinux\n");
+	pr_info("selinux_permissive: loaded (%d patch points)\n", i);
+	pr_info("  echo 1 > /sys/kernel/selinux_permissive/selinux_permissive  # permissive\n");
+	pr_info("  echo 0 > /sys/kernel/selinux_permissive/selinux_permissive  # enforcing\n");
 
 	return 0;
 }
 
 static void __exit selinux_permissive_exit(void)
 {
-	if (disabled)
-		selinux_restore();
+	if (permissive)
+		apply_state(false);
 
-	sysfs_remove_file(selinux_kobj, &disabled_attr.attr);
+	sysfs_remove_file(selinux_kobj, &permissive_attr.attr);
 	kobject_put(selinux_kobj);
 	pr_info("selinux_permissive: unloaded.\n");
 }
@@ -168,4 +266,4 @@ module_exit(selinux_permissive_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DBY-W09 Kernel Hack");
-MODULE_DESCRIPTION("Runtime SELinux disable via selinux_state without text patching");
+MODULE_DESCRIPTION("Runtime SELinux permissive toggle — 3 enforcement points patched");

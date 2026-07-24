@@ -287,15 +287,19 @@ kmake M=../selinux_module modules
 
 ### 8.2 使用
 
+> **警告**: 此模块直接修改内核代码，有死机/重启风险。建议**重启平板后单独测试**，
+> 确认稳定后再搭配其他内核模块（如 vhci-hcd）使用。若 `echo 1` 后死机，
+> 长按**音量下 + 电源键**强制重启。
+
 ```bash
 # 推送并加载
 adb push selinux_module/selinux_permissive.ko /sdcard/
 adb shell su -c "insmod /sdcard/selinux_permissive.ko"
 
-# 关闭 SELinux
+# 关闭 SELinux（permissive）
 adb shell su -c "echo 1 > /sys/kernel/selinux_permissive/selinux_permissive"
 
-# 恢复 SELinux
+# 恢复 SELinux（enforcing）
 adb shell su -c "echo 0 > /sys/kernel/selinux_permissive/selinux_permissive"
 
 # 卸载（自动恢复 enforcing）

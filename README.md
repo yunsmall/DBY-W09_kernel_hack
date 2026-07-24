@@ -28,7 +28,9 @@ Patch 原版内核的两个关键点（第三个是冗余安全网）：
 
 `tools/patch_mod_verify_sig.py` 自动定位并 patch，支持指纹+语义搜索。
 
-SELinux 关闭模块通过 `kallsyms_lookup_name()` 动态解析地址（KASLR 安全），运行时修改 `avc_denied` + `selinux_state.initialized`。
+SELinux 关闭模块通过 `kallsyms_lookup_name()` 动态解析地址（KASLR 安全），
+用内核自己的 `aarch64_insn_patch_text_nosync`（ftrace 同款机制）patch `avc_denied`
+使其永远返回 0。SELinux 其余功能（文件标签、安全上下文等）保持正常。
 
 ## 目录
 
