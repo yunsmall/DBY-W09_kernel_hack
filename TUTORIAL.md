@@ -248,6 +248,9 @@ sudo apt install clang-22 lld-22 gcc-aarch64-linux-gnu binutils-aarch64-linux-gn
 ### 7.2 编译
 
 ```bash
+# 应用必要的内核源码修复
+python3 tools/setup_kernel_source.py
+
 source env.sh
 cd dby-w09-4.0
 cp ../analysis/my_config .config
