@@ -4,6 +4,8 @@
 
 每一步都有**可复制粘贴的命令**。
 
+> Root 教程可参考 B 站 [BV1HLVa68EUv](https://www.bilibili.com/video/BV1HLVa68EUv)。
+
 > **不想自己 Patch？** 直接从 [Releases](https://github.com/yunsmall/DBY-W09_kernel_hack/releases)
 > 下载 `kernel_patched.gz`，跳到[第 5 步](#5-重新打包-bootimg)。
 
