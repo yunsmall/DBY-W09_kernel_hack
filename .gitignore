@@ -1,0 +1,29 @@
+# ── Kernel binaries ────────────────────────────────────────
+*.ko
+*.o
+*.mod.o
+*.mod.c
+*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+.tmp_vmlinux*
+vmlinux
+System.map
+
+# ── Boot images ────────────────────────────────────────────
+*.img
+*.squashfs
+
+# ── Stock files (from tablet, do not publish) ──────────────
+stock/
+
+# ── Build output ───────────────────────────────────────────
+output/
+kernel_patched.gz
+
+# ── Editor / OS ────────────────────────────────────────────
+*~
+*.swp
+.DS_Store
+dmesg_out
