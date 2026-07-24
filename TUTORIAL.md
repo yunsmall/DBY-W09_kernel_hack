@@ -174,6 +174,7 @@ mkbootimg \
   --ramdisk stock/boot_extracted/ramdisk \
   --dtb stock/boot_extracted/dtb \
   --base $(cat $UNPACKED/boot.img-base) \
+  --second_offset $(cat $UNPACKED/boot.img-second_offset) \
   --kernel_offset $(cat $UNPACKED/boot.img-kernel_offset) \
   --ramdisk_offset $(cat $UNPACKED/boot.img-ramdisk_offset) \
   --tags_offset $(cat $UNPACKED/boot.img-tags_offset) \
