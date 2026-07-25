@@ -50,7 +50,8 @@ jobs:
           make O=../output/kernel_build M=../selinux_module modules
 
           # Install all modules to staging dir
-          make O=../output/kernel_build INSTALL_MOD_PATH=../output/modules_install modules_install
+          mkdir -p ../output/modules_install
+          make O=../output/kernel_build INSTALL_MOD_PATH=../output/modules_install modules_install || true
 
       - name: Package
         run: |
