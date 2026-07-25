@@ -28,20 +28,29 @@ Patch 原版内核的两个关键点（第三个是冗余安全网）：
 
 `tools/patch_mod_verify_sig.py` 通过 kallsyms 精确定位，偏移配置在 `tools/kernel_patches.json`。
 
-SELinux 关闭模块通过时间戳匹配配置表，`kallsyms_lookup_name()` 动态解析地址，
-用内核自己的 `aarch64_insn_patch_text_nosync`（ftrace 同款机制）patch `avc_denied`
-使其永远返回 0。SELinux 其余功能（文件标签、安全上下文等）保持正常。
+SELinux 模块在运行时 patch 6 个内核执行点，绕过 `CONFIG_SECURITY_SELINUX_DEVELOP=n`
+导致的硬编码 enforcing。通过 `kallsyms_lookup_name()` 解析地址，用内核自带的
+`aarch64_insn_patch_text`（stop_machine）原子切换。控制接口：
+`/sys/kernel/selinux_permissive/selinux_permissive`（echo 1 → permissive，echo 0 → enforcing）。
+
+## 编译模块
+
+CI 手动触发编译：[Actions](../../actions/workflows/build-modules.yml)，输入平板内核 `.config` 的下载链接即可。
+产物：`all-modules.tar.gz`（全部模块）+ `selinux_permissive.ko`。
+
+本地编译见 [完整教程](TUTORIAL.md#7可选编译内核模块)。
 
 ## 目录
 
 ```
 README.md
 TUTORIAL.md              ← 完整教程
-env.sh                   ← 内核编译环境变量
-tools/                   ← patch_mod_verify_sig.py, verify_bootimg.py
-selinux_module/           ← SELinux 关闭模块
+env.sh                   ← 内核编译环境
+.github/workflows/       ← CI（手动触发编译模块）
+tools/                   ← patch_mod_verify_sig.py, verify_bootimg.py, verify_patches.py, setup_kernel_source.py
+selinux_module/           ← SELinux permissive 模块
 analysis/                ← 平板内核配置
-dby-w09-4.0/             ← 内核源码 (submodule)
+dby-w09-4.0/             ← 内核源码 (submodule → yunsmall/dby-w09-4.0 fork)
 ```
 
 ## 设备
@@ -60,6 +69,5 @@ dby-w09-4.0/             ← 内核源码 (submodule)
 - 刷入补丁内核不影响 Magisk（ramdisk 没动）
 - OTA 更新后内核可能变化，需重新 patch
 - 更新内核前先备份 kallsyms：`adb shell cat /proc/kallsyms > stock/tablet_kallsyms`
-- **编译模块用 `make`，编译完整内核用 `kmake`**。`kmake` 定义在 `env.sh`，将 LD 覆盖为 GNU ld + `--noinhibit-exec`，绕过 MSM 驱动的 `R_AARCH64_ABS32` 重定位硬错误（lld 的 `--noinhibit-exec` 无效）
+- **编译模块用 `make`，编译完整内核用 `kmake`**。`kmake` 定义在 `env.sh`，将 LD 覆盖为 `aarch64-linux-gnu-ld --noinhibit-exec`，绕过 MSM 驱动 `R_AARCH64_ABS32` 重定位硬错误
 - **源码编译的完整内核不能刷入平板**——华为有大量闭源驱动和 vendor patch，自编内核会导致卡 logo。编译内核仅用于获取 `Module.symvers` 来编译 `.ko` 模块
-- **SELinux 模块有死机风险**，建议重启平板后单独测试。若 `echo 1` 后死机，长按音量下+电源键强制重启。时间戳不匹配会拒绝加载，添加新内核支持见 TUTORIAL 常见问题
