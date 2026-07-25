@@ -14,7 +14,7 @@ Linux version 4.19.157-perf+ (HarmonyOS@localhost)
 #1 SMP PREEMPT Mon Jun 24 13:57:05 CST 2024
 ```
 
-> 不同版本/编译器的内核，补丁脚本的指纹匹配可能失败，语义搜索可能仍有效。
+> 不同编译时间的同一版本内核，patch 脚本通过 kallsyms 精确定位。
 
 ## 做了什么
 
@@ -26,9 +26,9 @@ Patch 原版内核的两个关键点（第三个是冗余安全网）：
 | #3 | `module_sig_check` 读取 `sig_enforce` | LDRB → MOV W8, WZR | **必须** |
 | #2 | `is_module_sig_enforced` | MOV X0,#0; RET | 冗余（仅 trace event 调用） |
 
-`tools/patch_mod_verify_sig.py` 自动定位并 patch，支持指纹+语义搜索。
+`tools/patch_mod_verify_sig.py` 通过 kallsyms 精确定位，偏移配置在 `tools/kernel_patches.json`。
 
-SELinux 关闭模块通过 `kallsyms_lookup_name()` 动态解析地址（KASLR 安全），
+SELinux 关闭模块通过时间戳匹配配置表，`kallsyms_lookup_name()` 动态解析地址，
 用内核自己的 `aarch64_insn_patch_text_nosync`（ftrace 同款机制）patch `avc_denied`
 使其永远返回 0。SELinux 其余功能（文件标签、安全上下文等）保持正常。
 

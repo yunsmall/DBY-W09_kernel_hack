@@ -1,7 +1,7 @@
 {
-  "description": "Per-kernel-timestamp patch offsets. Add entries for new kernels here.",
+  "description": "内核 patch 偏移配置。key 为 /proc/version 中的编译时间戳。",
   "known_kernels": {
-    "#1 SMP PREEMPT Mon Jun 24 13:57:05 CST 2024": {
+    "Mon Jun 24 13:57:05 CST 2024": {
       "comment": "HarmonyOS 4.2 stock kernel (DBY-W09 4.19.157-perf+)",
       "sig_enforce_ldrb_off": "0x130a34",
       "banner_offsets": ["0x1d800a3", "0x24800c3", "0x339df6f"],

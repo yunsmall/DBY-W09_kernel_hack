@@ -28,3 +28,4 @@ kernel_patched.gz
 *.swp
 .DS_Store
 dmesg_out
+__pycache__/

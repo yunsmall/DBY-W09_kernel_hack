@@ -7,7 +7,7 @@ Patch DBY-W09 内核 Image，绕过模块签名验证。
 
 用法:
   python3 patch_mod_verify_sig.py 内核 Image -o 输出文件 --kallsyms tablet_kallsyms
-  python3 patch_mod_verify_sig.py ... --timestamp "完整 Version 字符串" --brand
+  python3 patch_mod_verify_sig.py ... --timestamp "Mon Jun 24 13:57:05 CST 2024" --brand
 """
 
 import struct, gzip, sys, os, json, re
@@ -220,7 +220,7 @@ def main():
     p.add_argument('-o', '--output', required=True)
     p.add_argument('--kallsyms', required=True, help='kallsyms 符号表文件（必须）')
     p.add_argument('--brand', action='store_true', help='改 /proc/version 标记')
-    p.add_argument('--timestamp', help='内核编译时间戳，匹配后开启额外补丁 + 品牌')
+    p.add_argument('--timestamp', help='编译时间戳如 "Mon Jun 24 13:57:05 CST 2024"，匹配后开启品牌')
     args = p.parse_args()
 
     # ── 加载内核 ──

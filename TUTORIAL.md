@@ -78,7 +78,7 @@ mkdir -p stock
 adb shell su -c "dd if=/dev/block/by-name/boot of=/sdcard/boot.img"
 adb pull /sdcard/boot.img stock/boot.img
 
-# 备份 kallsyms（可选，patch 脚本定位函数时参考）
+# 备份 kallsyms（必须，patch 脚本定位函数用）
 adb shell cat /proc/kallsyms > stock/tablet_kallsyms
 ```
 
@@ -125,41 +125,74 @@ cp /tmp/unpacked/boot.img-dtb      stock/boot_extracted/dtb
 
 ## 4. Patch 内核
 
+patch 脚本通过 **kallsyms**（第 2 步已备份）精确定位每个 patch 点，
+根据 `/proc/version` 中的内核编译时间戳匹配配置：
+
+### 情况 A：内核时间戳在配置中（推荐）
+
+`tools/kernel_patches.json` 里记录了已知内核的精确偏移。如果时间戳匹配，
+加上 `--timestamp` 走精确模式，还会打品牌标记（`/proc/version` 显示 `BP` 而非 `#1`）。
+
+先从 `/proc/version` 获取时间戳（平板开机状态）：
+
+```bash
+adb shell cat /proc/version
+# 输出: Linux version 4.19.157-perf+ ... #1 SMP PREEMPT Mon Jun 24 13:57:05 CST 2024
+# 时间戳部分：Mon Jun 24 13:57:05 CST 2024
+```
+
 ```bash
 python3 tools/patch_mod_verify_sig.py stock/boot_extracted/kernel \
-    -o kernel_patched.gz --brand
+    -o kernel_patched.gz \
+    --kallsyms stock/tablet_kallsyms \
+    --timestamp "Mon Jun 24 13:57:05 CST 2024" \
+    --brand
 ```
 
-正常输出：
+### 情况 B：内核时间戳不在配置中
+
+如果时间戳不在 `kernel_patches.json` 里，不加 `--timestamp` 即可。
+脚本仍然通过 kallsyms 精确定位（不依赖启发式搜索），只是不打品牌标记。
+
+```bash
+python3 tools/patch_mod_verify_sig.py stock/boot_extracted/kernel \
+    -o kernel_patched.gz \
+    --kallsyms stock/tablet_kallsyms
+```
+
+> **如果时间戳不在配置中**，脚本会打印 WARNING。建议把时间戳和偏移加入
+> `tools/kernel_patches.json`（添加方式见 [常见问题](#常见问题)），方便下次直接用精确模式。
+
+### 正常输出：
 
 ```
-Kernel: 57,xxx,xxx bytes (54.x MiB)
-Found mod_verify_sig @ 0x134800  (fingerprint #1 at +0x1348dc)
-Found sig_enforce_LDRB @ 0x130a34  (LDRB->MOV_W8_WZR at +0x130a34)
+内核: 57,xxx,xxx 字节 (54.x MiB)  输入格式: gzip 压缩
+找到 mod_verify_sig @ 0x134800  (kallsyms)
+找到 is_module_sig_enforced @ 0x12da30  (kallsyms)
+找到 sig_enforce_LDRB @ 0x130a34  (kallsyms)
 
-Applying patches:
-  mod_verify_sig @ 0x134800  ...
-  sig_enforce_LDRB @ 0x130a34  ...
+应用 patch:
+  mod_verify_sig @ 0x134800  (kallsyms)
+    67B: ff 43 01 d1 ... → 02 00 00 14 ...
+  is_module_sig_enforced @ 0x12da30  (kallsyms)
+    8B: 88 94 01 f0 ... → e0 03 1f aa ...
+  sig_enforce_LDRB @ 0x130a34  (kallsyms)
+    4B: 08 61 53 39 → e8 03 1f 2a
   brand @ 0x1d800a3: → BP SMP PREEMPT
   brand @ 0x24800c3: → BP SMP PREEMPT
   brand @ 0x339df6f: → BP SMP PREEMPT
 
-Verification:
-  ✓ mod_verify_sig @ 0x134800: OK
-  ✓ sig_enforce_LDRB @ 0x130a34: OK
-  ✓ brand: 3x BP SMP PREEMPT
+验证:
+  ✓ mod_verify_sig
+  ✓ is_module_sig_enforced
+  ✓ sig_enforce_LDRB
+  ✓ brand: 3 处
 
-Done → kernel_patched.gz
+完成 → kernel_patched.gz (22,xxx,xxx 字节, gzip 压缩)
 ```
 
-**如果报 `no patch targets found`：** 你的内核版本和本教程不一致。本教程针对：
-
-```
-Linux version 4.19.157-perf+ (HarmonyOS@localhost)
-#1 SMP PREEMPT Mon Jun 24 13:57:05 CST 2024
-```
-
-脚本有语义搜索能力（跨编译器），不同版本可能仍有效，但不保证。
+**如果时间戳不在配置中**，脚本会用 WARNING 提示，但仍然通过 kallsyms 精确定位。
+建议将时间戳加入配置以便下次精确匹配。
 
 ---
 
@@ -285,6 +318,10 @@ kmake M=../selinux_module modules
 
 产物：`../selinux_module/selinux_permissive.ko`
 
+> 模块通过 `init_utsname()->version` 中的时间戳匹配已知内核配置表。
+> 如果时间戳不在 `known_kernels[]` 中，insmod 会拒绝加载。
+> 添加新内核支持见[常见问题](#常见问题)。
+
 ### 8.2 使用
 
 > **警告**: 此模块直接修改内核代码，有死机/重启风险。建议**重启平板后单独测试**，
@@ -320,11 +357,30 @@ fastboot reboot
 
 ## 常见问题
 
-**Q: 脚本报 `no patch targets found`**
+**Q: 怎么在内核配置和模块里添加新内核支持？**
 
-A: 内核版本不匹配。脚本搜索的是 HarmonyOS 4.2 的 4.19.157-perf+ 内核，
-但保留了语义搜索能力（跨编译器 ADRP+LDRB+RET 指令模式匹配），
-可能仍有效。如果完全搜不到，需要在新内核上手动逆向。
+A: 以时间戳 `Mon Jul 01 12:00:00 CST 2025` 为例，两步：
+
+1. `tools/kernel_patches.json` 的 `known_kernels` 里加一条：
+```json
+"Mon Jul 01 12:00:00 CST 2025": {
+  "sig_enforce_ldrb_off": "0x???",
+  "banner_offsets": ["0x???", "0x???", "0x???"],
+  "fingerprint_mod_verify_sig": ["..."],
+  ...
+}
+```
+
+2. `selinux_module/selinux_permissive.c` 的 `known_kernels[]` 里加一条：
+```c
+{ .timestamp = "Mon Jul 01 12:00:00 CST 2025",
+  .avc_denied_off = 0x??, .compute_sid_off = 0x???, .sid_mls_copy_off = 0x??? },
+```
+三个偏移需用 IDA 在新内核上逆向找到（与当前内核相同位置的 MOV 指令）。
+
+**Q: 脚本报 `sig_enforce LDRB 未找到`**
+
+A: 很可能是 kallsyms 文件不对（跟内核不是同一次开机的）。重新 `adb shell cat /proc/kallsyms > stock/tablet_kallsyms`。
 
 **Q: 刷完不开机**
 
