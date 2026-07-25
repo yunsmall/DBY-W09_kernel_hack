@@ -20,7 +20,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: Download kernel config
         run: |
@@ -49,9 +49,11 @@ jobs:
           # SELinux module
           make O=../output/kernel_build M=../selinux_module modules
 
-          # Install all modules to staging dir
-          mkdir -p ../output/modules_install
-          make O=../output/kernel_build INSTALL_MOD_PATH=../output/modules_install modules_install || true
+          # Install all modules to staging dir.
+          # INSTALL_MOD_PATH 是相对于 O= 目录，用绝对路径。
+          MODULES_DIR="$PWD/../output/modules_install"
+          mkdir -p "$MODULES_DIR"
+          make O=../output/kernel_build INSTALL_MOD_PATH="$MODULES_DIR" modules_install || true
 
       - name: Package
         run: |
