@@ -277,30 +277,46 @@ dmesg | grep bypassed
 
 ```bash
 # Debian/Ubuntu
-sudo apt install clang-22 lld-22 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+sudo apt install clang-22 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+```
+
+把 llvm-22 的 bin 目录加到 PATH：
+
+```bash
+export PATH="/usr/lib/llvm-22/bin:$PATH"
 ```
 
 ### 7.2 编译
 
+> `kmake` 定义在 `env.sh`，`source env.sh` 后即可使用。
+
 ```bash
-# 应用必要的内核源码修复
+source env.sh
+
+# 应用必要的内核源码 patch（gcc-wrapper、mkcompile_h 等）
 python3 tools/setup_kernel_source.py
 
-source env.sh
+mkdir -p output/kernel_build
+cp analysis/my_tablet_origin_config output/kernel_build/.config
 cd dby-w09-4.0
-cp ../analysis/my_config .config
-make olddefconfig
+make O=../output/kernel_build olddefconfig
 
-# 开启 MODVERSIONS（平板内核开启了，必须匹配 CRC）
-scripts/config -e MODVERSIONS
+# 调整配置
+scripts/config --file ../output/kernel_build/.config --disable MODULE_SIG
+scripts/config --file ../output/kernel_build/.config --set-str SYSTEM_TRUSTED_KEYS ""
+scripts/config --file ../output/kernel_build/.config --set-str MODULE_SIG_KEY ""
+scripts/config --file ../output/kernel_build/.config --disable QCA_CLD_WLAN
+scripts/config --file ../output/kernel_build/.config -e MODVERSIONS
 
-make modules_prepare
-kmake modules
+kmake O=../output/kernel_build modules_prepare
+kmake O=../output/kernel_build modules
 ```
 
 产物在 `dby-w09-4.0/` 下各子目录。
 
-> **已知问题**: WiFi 驱动 `qcacld` 缺 `athdefs.h` 等头文件，无法编译。
+> **注意**: 源码编译的完整内核（vmlinux/Image.gz）**不要刷入平板**——华为
+> 有大量闭源驱动和 vendor patch，自编内核会卡在开机 logo。编译仅用于生成
+> `Module.symvers`（符号 CRC 表），以便编译与平板内核匹配的 `.ko` 模块。
 
 ---
 
@@ -313,7 +329,7 @@ kmake modules
 
 ```bash
 source env.sh && cd dby-w09-4.0
-kmake M=../selinux_module modules
+kmake O=../output/kernel_build M=../selinux_module modules
 ```
 
 产物：`../selinux_module/selinux_permissive.ko`

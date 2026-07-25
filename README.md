@@ -60,3 +60,4 @@ dby-w09-4.0/             ← 内核源码 (submodule)
 - 刷入补丁内核不影响 Magisk（ramdisk 没动）
 - OTA 更新后内核可能变化，需重新 patch
 - 更新内核前先备份 kallsyms：`adb shell cat /proc/kallsyms > stock/tablet_kallsyms`
+- **源码编译的完整内核不能刷入平板**——华为有大量闭源驱动和 vendor patch，自编内核会导致卡 logo。编译内核仅用于获取 `Module.symvers` 来编译 `.ko` 模块
