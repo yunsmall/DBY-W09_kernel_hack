@@ -1,367 +1,287 @@
 #!/usr/bin/env python3
 """
-Patch DBY-W09 kernel Image to bypass module signature verification.
+Patch DBY-W09 内核 Image，绕过模块签名验证。
 
-Two essential patches (patch #2 is redundant — see below):
-  1. mod_verify_sig          → printk trampoline + return 0
-  3. sig_enforce LDRB in module_sig_check → MOV W8, WZR (always 0)
+通过 kallsyms 文件精确定位所有 patch 点，不依赖指纹或启发式搜索。
+如果提供了 --timestamp 且匹配已知内核，还会打 is_module_sig_enforced 冗余补丁。
 
-Flow in module_sig_check (HarmonyOS 4.2 kernel):
-  ├─ [module has signature marker]
-  │   → mod_verify_sig() → patch #1 always returns 0
-  └─ [module has NO signature marker]
-       → LDRB sig_enforce → patch #3 forces W8=0 → CBZ always taken
-       → enforcement check skipped, module loads
-
-Also patches is_module_sig_enforced (patch #2, REDUNDANT):
-  - is_module_sig_enforced is only called from trace_event_raw_event_module_load,
-    a trace event handler that records enforcement state for logging.
-  - It is NOT called from the actual module load path.
-  - Patch #3 makes this unreachable anyway (CBZ always branches over the call).
-  - Kept as a safety net against OTA changes; can be removed to save 8 bytes.
-
-Usage:
-  python3 patch_mod_verify_sig.py stock/boot_extracted/kernel -o kernel_patched.gz
-  python3 patch_mod_verify_sig.py stock/boot_extracted/kernel -o kernel_patched.gz --brand
+用法:
+  python3 patch_mod_verify_sig.py 内核 Image -o 输出文件 --kallsyms tablet_kallsyms
+  python3 patch_mod_verify_sig.py ... --timestamp "完整 Version 字符串" --brand
 """
 
-import struct
-import gzip
-import sys
-import os
+import struct, gzip, sys, os, json, re
 
-# ── Patch data ───────────────────────────────────────────────────────
+HERE = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(HERE, 'kernel_patches.json')) as f:
+    CONFIG = json.load(f)
 
-# Simple MOV X0,XZR; RET (8 bytes)
-MOV_RET = bytes.fromhex('e0031faac0035fd6')
-# MOV W8, WZR (4 bytes) — replace LDRB sig_enforce, makes CBZ always branch
+# ── ARM64 指令 ────────────────────────────────────────────────────────
+
+MOV_RET    = bytes.fromhex('e0031faac0035fd6')
 MOV_W8_WZR = bytes.fromhex('e8031f2a')
-SIG_ENFORCE_LDRB_OFF = 0x130a34  # file offset where module_sig_check reads sig_enforce
+TRAMPOLINE = bytes.fromhex(
+    '02000014'  '1f2003d5'   # B +8; NOP
+    'fd7bbfa9'  'a0000010'   # STP X29,X30; ADR X0,msg
+    '32d8fe97'  'fd7bc1a8'   # BL printk; LDP X29,X30
+    'e0031faa'  'c0035fd6'   # MOV X0,XZR; RET
+) + b'mod_verify_sig: bypassed by patch\n\x00'
 
-# printk trampoline for mod_verify_sig:
-# Layout at function entry:
-#   +0: B +8              (jump to trampoline at +8)
-#   +4: NOP               (padding)
-#   +8: STP X29,X30,...   (save frame)
-#  +12: ADR X0, msg       (point to string)
-#  +16: BL printk         (call printk)
-#  +20: LDP X29,X30,...   (restore frame)
-#  +24: MOV X0, XZR       (return 0)
-#  +28: RET
-#  +32: "mod_verify_sig: bypassed by patch\n\0"
+PATCH_BYTES = {
+    'mod_verify_sig':         TRAMPOLINE,
+    'is_module_sig_enforced': MOV_RET,
+    'sig_enforce_LDRB':       MOV_W8_WZR,
+}
 
-TRAMPOLINE_BYTES = bytes.fromhex(
-    '02000014'   # B +8
-    '1f2003d5'   # NOP
-    'fd7bbfa9'   # STP X29, X30, [SP, #-16]!
-    'a0000010'   # ADR X0, +0x14   → points to string at +32
-    '32d8fe97'   # BL printk       → PC-relative to printk @ 0xffffff9391b6a8d8
-    'fd7bc1a8'   # LDP X29, X30, [SP], #16
-    'e0031faa'   # MOV X0, XZR
-    'c0035fd6'   # RET
-)
-TRAMPOLINE_MSG = b'mod_verify_sig: bypassed by patch\n\x00'
+def u32(data, off):
+    return struct.unpack('<I', data[off:off+4])[0]
 
-# Version branding
-VERSION_OLD = b'#1 SMP PREEMPT'
-VERSION_NEW = b'BP SMP PREEMPT'
-# Version branding: "#1 SMP PREEMPT" → "BP SMP PREEMPT" (shows in /proc/version)
-BANNER_OFFSETS = [0x1d800a3, 0x24800c3, 0x339df6f]
+# ═══════════════════════════════════════════════════════════════════════
+# kallsyms 解析
+# ═══════════════════════════════════════════════════════════════════════
 
-# ── ARM64 instruction helpers ─────────────────────────────────────────
+def parse_kallsyms(path):
+    """解析 kallsyms，返回 {符号名: (地址, 类型)}"""
+    syms = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                addr = int(parts[0], 16)
+                ty = parts[1]
+                name = parts[2]
+                syms[name] = (addr, ty)
+    return syms
 
-def is_b_cc(inst):
-    return (inst & 0xFF00001F) == 0x54000003
+def sym_file_off(syms, name, text_addr):
+    """符号的虚拟地址 → 文件偏移"""
+    if name not in syms:
+        return None
+    return syms[name][0] - text_addr
 
-def is_sub_imm(inst):
-    return (inst >> 24) == 0xD1
+# ═══════════════════════════════════════════════════════════════════════
+# 定位函数
+# ═══════════════════════════════════════════════════════════════════════
 
-def is_ldr_x_reg_offset(inst):
-    return (inst & 0xFFC00000) == 0xF9400000
+def func_prologue(data, off):
+    """从 off 往前找函数入口（SUB SP 或 STP X29,X30）"""
+    for o in range(off, max(off - 4096, 0), -4):
+        inst = u32(data, o)
+        if (inst & 0xFF0000FF) == 0xD10000FF:          # SUB SP, SP, #imm
+            return o
+        if (inst & 0xFFC07FFF) == 0xA9007BFD:           # STP X29, X30, [SP, #imm]
+            if o >= 4 and (u32(data, o - 4) & 0xFF0000FF) == 0xD10000FF:
+                return o - 4
+            return o
+    return off
 
-def get_ldr_rt(inst):
-    return inst & 0x1F
+def find_bl_to(data, start, end, target):
+    """在 [start,end) 找 BL target"""
+    for o in range(start, end, 4):
+        inst = u32(data, o)
+        if (inst >> 26) != 0x25:
+            continue
+        off = inst & 0x03FFFFFF
+        if off & 0x02000000: off |= 0xFC000000
+        if o + (off << 2) == target:
+            return o
+    return None
 
-def get_ldr_rn(inst):
-    return (inst >> 5) & 0x1F
+# ═══════════════════════════════════════════════════════════════════════
+# kallsyms 精确定位（所有模式共用）
+# ═══════════════════════════════════════════════════════════════════════
 
-def get_ldr_offset(inst):
-    return ((inst >> 10) & 0xFFF) << 3
+def find_targets_by_kallsyms(data, syms, text_addr):
+    """通过 kallsyms 精确定位所有 patch 点"""
 
-def get_sub_rd(inst):
-    return inst & 0x1F
+    # 1. mod_verify_sig — 直接拿地址
+    mv_off = sym_file_off(syms, 'mod_verify_sig', text_addr)
+    if mv_off is None:
+        print("错误: kallsyms 中未找到 mod_verify_sig"); sys.exit(1)
+    mv_prologue = func_prologue(data, mv_off)
+    results = [('mod_verify_sig', mv_prologue, 'kallsyms')]
 
-def get_sub_rn(inst):
-    return (inst >> 5) & 0x1F
+    # 2. is_module_sig_enforced — 直接拿地址
+    is_off = sym_file_off(syms, 'is_module_sig_enforced', text_addr)
+    if is_off is not None:
+        results.append(('is_module_sig_enforced', is_off, 'kallsyms'))
 
-def get_sub_imm(inst):
-    return (inst >> 10) & 0xFFF
-
-# ── Prologue detection ────────────────────────────────────────────────
-
-def walk_to_prologue(data, known_offset):
-    for off in range(known_offset, max(known_offset - 128, 0), -4):
-        inst = struct.unpack('<I', data[off:off + 4])[0]
-        if (inst & 0xFF0000FF) == 0xD10000FF:      # SUB SP, SP, #imm
-            return off
-        if (inst & 0xFFC07FFF) == 0xA9007BFD:       # STP X29, X30, [SP, #imm]
-            if off >= 4:
-                prev = struct.unpack('<I', data[off - 4:off])[0]
-                if (prev & 0xFF0000FF) == 0xD10000FF:
-                    return off - 4
-            return off
-    return known_offset
-
-# ── Target finders ────────────────────────────────────────────────────
-
-def find_mod_verify_sig(data):
-    """Find mod_verify_sig by LDR [X1,#24] + CMP #13 + B.CC + SUB #12."""
-
-    FINGERPRINTS = [
-        bytes.fromhex('280c40f91f3500f143050054153100d1f40301aaf30300aa'),
-        bytes.fromhex('280c40f91f3500f183040054083100d1000900088b'),
-    ]
-    for i, fp in enumerate(FINGERPRINTS):
-        off = data.find(fp)
-        if off != -1:
-            prologue = walk_to_prologue(data, off)
-            return prologue, f"fingerprint #{i+1} at +0x{off:x}"
-
-    for rt in list(range(10)) + list(range(19, 29)):
-        ldr_pat = struct.pack('<I', 0xF9400C20 | rt)
-        pos = 0
-        while pos < len(data) - 24:
-            pos = data.find(ldr_pat, pos)
-            if pos == -1:
-                break
-            if pos + 20 > len(data):
-                break
-            insts = [struct.unpack('<I', data[pos + i*4:pos + (i+1)*4])[0]
-                     for i in range(5)]
-            i0, i1, i2, i3 = insts[0], insts[1], insts[2], insts[3]
-            if not (is_ldr_x_reg_offset(i0) and get_ldr_rn(i0) == 1 and get_ldr_offset(i0) == 24):
-                pos += 4; continue
-            if i1 != 0xF100351F:
-                pos += 4; continue
-            if not is_b_cc(i2):
-                pos += 4; continue
-            if not (is_sub_imm(i3) and get_sub_rn(i3) == rt and get_sub_imm(i3) == 12):
-                pos += 4; continue
-            prologue = walk_to_prologue(data, pos)
-            return prologue, f"semantic LDR+CMP+SUB (X{rt}) at +0x{pos:x}"
-
-    return None, "not found"
-
-
-def find_is_module_sig_enforced(data):
-    """Find is_module_sig_enforced: ADRP + LDRB W0 + RET (12 bytes)."""
-
-    FINGERPRINTS = [
-        bytes.fromhex('889401f000615339c0035fd6'),
-    ]
-    for i, fp in enumerate(FINGERPRINTS):
-        off = data.find(fp)
-        if off != -1 and off % 4 == 0:
-            return off, f"fingerprint #{i+1} at +0x{off:x}"
-
-    pos = 0
-    while pos + 12 <= len(data):
-        insts = struct.unpack('<III', data[pos:pos+12])
-        i0, i1, i2 = insts
-        if (i0 & 0x9F000000) != 0x90000000:
-            pos += 4; continue
-        adrp_rd = i0 & 0x1F
-        if (i1 & 0xFFC00000) != 0x39400000:
-            pos += 4; continue
-        if (i1 & 0x1F) != 0:            # must be W0 (return reg)
-            pos += 4; continue
-        if ((i1 >> 5) & 0x1F) != adrp_rd:
-            pos += 4; continue
-        if i2 != 0xD65F03C0:             # RET
-            pos += 4; continue
-        return pos, f"semantic ADRP+LDRB+RET at +0x{pos:x}"
-
-    return None, "not found"
-
-
-def find_all_targets(data):
-    results = []
-    off, method = find_mod_verify_sig(data)
-    if off is not None:
-        results.append(('mod_verify_sig', off, method))
-    off, method = find_is_module_sig_enforced(data)
-    if off is not None:
-        results.append(('is_module_sig_enforced', off, method))
-    # 3. sig_enforce LDRB patch (fixed offset, verify fingerprint)
-    fp = data[SIG_ENFORCE_LDRB_OFF:SIG_ENFORCE_LDRB_OFF+4]
-    if (struct.unpack('<I', fp)[0] & 0xFFC003FF) == 0x39400108:
-        results.append(('sig_enforce_LDRB', SIG_ENFORCE_LDRB_OFF, f'LDRB->MOV_W8_WZR at +0x{SIG_ENFORCE_LDRB_OFF:x}'))
+    # 3. sig_enforce LDRB — 需要找到引用 sig_enforce 变量的指令
+    se_off = find_sig_enforce_ldrb_by_kallsyms(data, syms, text_addr, mv_prologue)
+    if se_off is None:
+        print("错误: 未找到 sig_enforce LDRB 指令"); sys.exit(1)
+    results.append(('sig_enforce_LDRB', se_off, 'kallsyms'))
 
     return results
 
-# ── Patch application ─────────────────────────────────────────────────
+def find_sig_enforce_ldrb_by_kallsyms(data, syms, text_addr, mv_prologue):
+    """通过 kallsyms 找到 sig_enforce LDRB 指令
 
-def apply_patches(data, targets, brand=False):
-    """Apply all patches to kernel data. Returns patched data + summary."""
+    1. 从 kallsyms 获取 sig_enforce 变量地址
+    2. 定位 module_sig_check（通过 BL mod_verify_sig）
+    3. 在 module_sig_check 内找引用 sig_enforce 地址的 LDRB
+    """
+    se_addr = sym_file_off(syms, 'sig_enforce', text_addr)
+    if se_addr is None:
+        return None
 
-    summary = []
+    # 定位 module_sig_check = 包含 BL mod_verify_sig 的函数
+    # module_sig_check 可能在 mod_verify_sig 之前或之后，两个方向都搜
+    bl_off = find_bl_to(data, max(mv_prologue - 0x8000, 0),
+                        min(mv_prologue + 0x1000, len(data)), mv_prologue)
+    if bl_off is None:
+        return None
 
-    for name, offset, method in targets:
-        if name == 'mod_verify_sig':
-            # Apply trampoline: B+8 + NOP + trampoline code + string
-            patch = TRAMPOLINE_BYTES + TRAMPOLINE_MSG
-            orig = data[offset:offset + len(patch)]
-            data = bytearray(data)
-            data[offset:offset + len(patch)] = patch
-            summary.append(
-                f"  {name} @ 0x{offset:x}  ({method})\n"
-                f"    trampoline: {len(TRAMPOLINE_BYTES)}b code + {len(TRAMPOLINE_MSG)}b string\n"
-                f"    first 8 bytes: {orig[:8].hex(' ')} → {patch[:8].hex(' ')}"
-            )
-        elif name == 'sig_enforce_LDRB':
-            orig = data[offset:offset + len(MOV_W8_WZR)]
-            data = bytearray(data)
-            data[offset:offset + len(MOV_W8_WZR)] = MOV_W8_WZR
-            summary.append(
-                f"  {name} @ 0x{offset:x}  ({method})\n"
-                f"    {len(MOV_W8_WZR)} bytes: {orig.hex(' ')} → {MOV_W8_WZR.hex(' ')}"
-            )
-        else:  # is_module_sig_enforced: simple MOV,RET
-            orig = data[offset:offset + len(MOV_RET)]
-            data = bytearray(data)
-            data[offset:offset + len(MOV_RET)] = MOV_RET
-            summary.append(
-                f"  {name} @ 0x{offset:x}  ({method})\n"
-                f"    {len(MOV_RET)} bytes: {orig.hex(' ')} → {MOV_RET.hex(' ')}"
-            )
+    msc_prologue = func_prologue(data, bl_off)
 
-    data = bytes(data)
+    # sig_enforce 变量文件偏移 → ARM64 中通过 ADRP + LDRB 访问
+    # ADRP 加载页地址，LDRB 加上页内偏移
+    se_page = se_addr & ~0xFFF
+    se_page_off = se_addr & 0xFFF
 
-    # Brand version string (UTS_VERSION, shows in /proc/version)
-    if brand:
-        pos = 0
-        count = 0
-        while True:
-            pos = data.find(VERSION_OLD, pos)
-            if pos == -1:
-                break
-            data = bytearray(data)
-            data[pos:pos + len(VERSION_OLD)] = VERSION_NEW
-            data = bytes(data)
-            summary.append(f"  brand @ 0x{pos:x}: → {VERSION_NEW.decode()}")
-            count += 1
-            pos += 1
-        if count == 0:
-            summary.append(f"  brand: SKIP (VERSION_OLD not found)")
+    # 扫描 module_sig_check 内的 ADRP 指令
+    # ADRP Xd, #imm: imm21 << 12 = target_page - (PC & ~0xFFF)
+    for o in range(msc_prologue, msc_prologue + 0x800, 4):
+        inst = u32(data, o)
+        if (inst & 0x9F000000) != 0x90000000:  # ADRP
+            continue
 
-    return data, summary
+        # 计算 ADRP 目标页
+        imm21 = (((inst >> 5) & 0x7FFFF) << 2) | ((inst >> 29) & 0x3)
+        if imm21 & 0x100000:
+            imm21 |= 0xFFE00000  # sign-extend 21-bit
+        target_page = (o & ~0xFFF) + (imm21 << 12)
 
-# ── Verification ──────────────────────────────────────────────────────
+        if target_page != se_page:
+            continue
 
-def verify(data, targets, brand=False):
-    """Verify patches are applied correctly."""
+        adrp_rd = inst & 0x1F
+
+        # 找到对应的 LDRB Wx, [Xd, #off]
+        for l in range(o + 4, min(o + 24, msc_prologue + 0x800), 4):
+            ldrb = u32(data, l)
+            if ((ldrb & 0xFFC00000) == 0x39400000 and        # LDRB
+                ((ldrb >> 5) & 0x1F) == adrp_rd and          # [ADRP reg]
+                ((ldrb >> 10) & 0xFFF) == se_page_off):      # 偏移匹配
+                return l
+
+    return None
+
+# ═══════════════════════════════════════════════════════════════════════
+# 品牌和验证
+# ═══════════════════════════════════════════════════════════════════════
+
+def apply_branding(data, cfg):
+    old_b = cfg['banner_old'].encode()
+    new_b = cfg['banner_new'].encode()
+    lines = []
+    for o_str in cfg.get('banner_offsets', []):
+        o = int(o_str, 16)
+        if data[o:o+len(old_b)] == old_b:
+            data = bytearray(data); data[o:o+len(old_b)] = new_b; data = bytes(data)
+            lines.append(f"  brand @ 0x{o:x}: → {cfg['banner_new']}")
+    return data, lines
+
+def apply_patches(data, targets):
+    lines = []
+    for name, off, method in targets:
+        if name not in PATCH_BYTES:
+            continue
+        b = PATCH_BYTES[name]
+        old = data[off:off+len(b)].hex(' ')
+        data = bytearray(data); data[off:off+len(b)] = b; data = bytes(data)
+        lines.append(f"  {name} @ 0x{off:x}  ({method})\n"
+                     f"    {len(b)}B: {old} → {b[:8].hex(' ')}")
+    return data, lines
+
+def verify_patches(data, targets, cfg, brand):
     ok = True
-
-    for name, offset, _ in targets:
-        if name == 'mod_verify_sig':
-            expected_len = len(TRAMPOLINE_BYTES) + len(TRAMPOLINE_MSG)
-            actual = data[offset:offset + expected_len]
-            expected = TRAMPOLINE_BYTES + TRAMPOLINE_MSG
-            if actual == expected:
-                print(f"  ✓ {name} @ 0x{offset:x}: OK ({expected_len} bytes)")
-            else:
-                print(f"  ✗ {name} @ 0x{offset:x}: MISMATCH")
-                ok = False
-        elif name == 'sig_enforce_LDRB':
-            if data[offset:offset + len(MOV_W8_WZR)] == MOV_W8_WZR:
-                print(f"  ✓ {name} @ 0x{offset:x}: OK")
-            else:
-                print(f"  ✗ {name} @ 0x{offset:x}: MISMATCH")
-                ok = False
-        else:
-            if data[offset:offset + len(MOV_RET)] == MOV_RET:
-                print(f"  ✓ {name} @ 0x{offset:x}: OK")
-            else:
-                print(f"  ✗ {name} @ 0x{offset:x}: MISMATCH")
-                ok = False
-
-    if brand:
-        pos = 0
-        old_count = 0
-        while True:
-            pos = data.find(VERSION_OLD, pos)
-            if pos == -1: break
-            old_count += 1
-            pos += 1
-        pos = 0
-        new_count = 0
-        while True:
-            pos = data.find(VERSION_NEW, pos)
-            if pos == -1: break
-            new_count += 1
-            pos += 1
-        if old_count == 0 and new_count >= 1:
-            print(f"  ✓ brand: {new_count}x {VERSION_NEW.decode()}")
-        else:
-            print(f"  ✗ brand: {old_count} old, {new_count} new")
-            ok = False
-
+    for name, off, _ in targets:
+        if name not in PATCH_BYTES: continue
+        b = PATCH_BYTES[name]
+        good = data[off:off+len(b)] == b
+        print(f"  {'✓' if good else '✗'} {name}")
+        ok = ok and good
+    if brand and cfg:
+        n = data.count(cfg['banner_new'].encode())
+        print(f"  {'✓' if n else '✗'} brand: {n} 处")
+        ok = ok and n > 0
     return ok
 
-# ── Main ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(
-        description="Patch DBY-W09 kernel to bypass module signature verification")
-    p.add_argument('input', help='Kernel Image (raw or gzipped)')
-    p.add_argument('-o', '--output', required=True,
-                   help='Output file (.img raw, else compressed)')
-    p.add_argument('--brand', action='store_true',
-                   help='Brand version string: 4.19.157-BYPS+ (banner only, vermagic intact)')
-    p.add_argument('-v', '--verbose', action='store_true')
+    p = argparse.ArgumentParser(description='Patch DBY-W09 内核，绕过模块签名验证')
+    p.add_argument('input')
+    p.add_argument('-o', '--output', required=True)
+    p.add_argument('--kallsyms', required=True, help='kallsyms 符号表文件（必须）')
+    p.add_argument('--brand', action='store_true', help='改 /proc/version 标记')
+    p.add_argument('--timestamp', help='内核编译时间戳，匹配后开启额外补丁 + 品牌')
     args = p.parse_args()
 
+    # ── 加载内核 ──
     with open(args.input, 'rb') as f:
         data = f.read()
-
     is_gz = data[:2] == b'\x1f\x8b'
+    ftype = 'gzip 压缩' if is_gz else ('原始 Image' if data[:4] == b'\x00\x00\x00\x00' else '未知格式')
     if is_gz:
         data = gzip.decompress(data)
+    print(f"内核: {len(data):,} 字节 ({len(data)/1024**2:.1f} MiB)  输入格式: {ftype}")
 
-    print(f"Kernel: {len(data):,} bytes ({len(data)/1024**2:.1f} MiB)")
+    # ── 解析 kallsyms ──
+    syms = parse_kallsyms(args.kallsyms)
+    text_addr = syms.get('_text', (0,))[0]
+    if text_addr == 0:
+        print("错误: kallsyms 中未找到 _text"); sys.exit(1)
+    print(f"_text: 0x{text_addr:x}")
 
-    # Find targets
-    targets = find_all_targets(data)
-    if not targets:
-        print("ERROR: no patch targets found!")
-        sys.exit(1)
+    # ── 时间戳检查 ──
+    cfg = None
+    if args.timestamp:
+        for ts, c in CONFIG['known_kernels'].items():
+            if args.timestamp == ts:
+                cfg = c
+                print(f"时间戳匹配: {ts[:40]}...\n")
+                break
+        if cfg is None:
+            print(f"WARNING: 时间戳 '{args.timestamp}' 不在配置中\n")
+    else:
+        found = [ts for ts in CONFIG['known_kernels'] if ts.encode() in data]
+        if found:
+            print(f"内核匹配配置: [{found[0][:40]}...]  (可加 --timestamp 开启品牌)\n")
 
-    for name, offset, method in targets:
-        print(f"Found {name} @ 0x{offset:x}  ({method})")
+    # ── 定位 ──
+    targets = find_targets_by_kallsyms(data, syms, text_addr)
 
-    # Apply patches
-    print("\nApplying patches:")
-    data, summary = apply_patches(data, targets, brand=args.brand)
-    for s in summary:
-        print(s)
 
-    # Verify
-    print("\nVerification:")
-    if not verify(data, targets, brand=args.brand):
-        print("\nERROR: verification failed!")
-        sys.exit(1)
+    for name, off, method in targets:
+        print(f"找到 {name} @ 0x{off:x}  ({method})")
 
-    # Compress & save
-    do_gz = args.output.endswith('.gz') or (
-        is_gz and not (args.output.endswith('.img') or args.output.endswith('.raw')))
+    # ── 应用 ──
+    print("\n应用 patch:")
+    data, lines = apply_patches(data, targets)
+    if args.brand and cfg:
+        data, blines = apply_branding(data, cfg)
+        lines.extend(blines)
+    for line in lines: print(line)
+
+    # ── 验证 ──
+    print("\n验证:")
+    if not verify_patches(data, targets, cfg, args.brand):
+        print("\n错误: 验证失败!"); sys.exit(1)
+
+    # ── 保存 ──
+    do_gz = args.output.endswith('.gz') or (is_gz and not args.output.endswith(('.img','.raw')))
     if do_gz:
+        raw_size = len(data)
         data = gzip.compress(data, compresslevel=9)
-
-    with open(args.output, 'wb') as f:
-        f.write(data)
-    print(f"\nDone → {args.output} ({len(data):,} bytes)")
-
+        print(f"\n完成 → {args.output}  ({len(data):,} 字节, gzip 压缩, 原始 {raw_size:,} 字节)")
+    else:
+        print(f"\n完成 → {args.output}  ({len(data):,} 字节, 原始 Image)")
 
 if __name__ == '__main__':
     main()

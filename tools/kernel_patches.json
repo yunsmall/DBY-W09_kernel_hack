@@ -1,0 +1,23 @@
+{
+  "description": "Per-kernel-timestamp patch offsets. Add entries for new kernels here.",
+  "known_kernels": {
+    "#1 SMP PREEMPT Mon Jun 24 13:57:05 CST 2024": {
+      "comment": "HarmonyOS 4.2 stock kernel (DBY-W09 4.19.157-perf+)",
+      "sig_enforce_ldrb_off": "0x130a34",
+      "banner_offsets": ["0x1d800a3", "0x24800c3", "0x339df6f"],
+      "banner_old": "#1 SMP PREEMPT",
+      "banner_new": "BP SMP PREEMPT",
+      "fingerprint_mod_verify_sig": [
+        "280c40f91f3500f143050054153100d1f40301aaf30300aa",
+        "280c40f91f3500f183040054083100d1000900088b"
+      ],
+      "fingerprint_is_module_sig_enforced": [
+        "889401f000615339c0035fd6"
+      ]
+    }
+  },
+  "fallback": {
+    "banner_old": "#1 SMP PREEMPT",
+    "banner_new": "BP SMP PREEMPT"
+  }
+}
