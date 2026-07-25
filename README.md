@@ -60,4 +60,6 @@ dby-w09-4.0/             ← 内核源码 (submodule)
 - 刷入补丁内核不影响 Magisk（ramdisk 没动）
 - OTA 更新后内核可能变化，需重新 patch
 - 更新内核前先备份 kallsyms：`adb shell cat /proc/kallsyms > stock/tablet_kallsyms`
+- **编译模块用 `make`，编译完整内核用 `kmake`**。`kmake` 定义在 `env.sh`，将 LD 覆盖为 GNU ld + `--noinhibit-exec`，绕过 MSM 驱动的 `R_AARCH64_ABS32` 重定位硬错误（lld 的 `--noinhibit-exec` 无效）
 - **源码编译的完整内核不能刷入平板**——华为有大量闭源驱动和 vendor patch，自编内核会导致卡 logo。编译内核仅用于获取 `Module.symvers` 来编译 `.ko` 模块
+- **SELinux 模块有死机风险**，建议重启平板后单独测试。若 `echo 1` 后死机，长按音量下+电源键强制重启。时间戳不匹配会拒绝加载，添加新内核支持见 TUTORIAL 常见问题

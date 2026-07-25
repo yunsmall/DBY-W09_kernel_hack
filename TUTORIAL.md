@@ -288,12 +288,10 @@ export PATH="/usr/lib/llvm-22/bin:$PATH"
 
 ### 7.2 编译
 
-> `kmake` 定义在 `env.sh`，`source env.sh` 后即可使用。
+> 编译 `.ko` 用 `make`。如需编译完整 vmlinux，用 `kmake` 代替（定义在 `env.sh`）。
 
 ```bash
 source env.sh
-
-# 应用必要的内核源码 patch（gcc-wrapper、mkcompile_h 等）
 python3 tools/setup_kernel_source.py
 
 mkdir -p output/kernel_build
@@ -301,48 +299,34 @@ cp analysis/my_tablet_origin_config output/kernel_build/.config
 cd dby-w09-4.0
 make O=../output/kernel_build olddefconfig
 
-# 调整配置
-scripts/config --file ../output/kernel_build/.config --disable MODULE_SIG
-scripts/config --file ../output/kernel_build/.config --set-str SYSTEM_TRUSTED_KEYS ""
-scripts/config --file ../output/kernel_build/.config --set-str MODULE_SIG_KEY ""
-scripts/config --file ../output/kernel_build/.config --disable QCA_CLD_WLAN
-scripts/config --file ../output/kernel_build/.config -e MODVERSIONS
+# 唯一必须改的选项：关闭模块自动签名
+# 平板内核 MODULE_SIG_ALL=y 会调用华为的 sign-kernel.sh，
+# 本地没有这个脚本，必须关掉。生成的 .ko 不带签名，
+# 刷了 patched 内核后可以正常加载。
+scripts/config --file ../output/kernel_build/.config --disable MODULE_SIG_ALL
 
-kmake O=../output/kernel_build modules_prepare
-kmake O=../output/kernel_build modules
+make O=../output/kernel_build modules_prepare
+make O=../output/kernel_build modules
 ```
 
 产物在 `dby-w09-4.0/` 下各子目录。
-
-> **注意**: 源码编译的完整内核（vmlinux/Image.gz）**不要刷入平板**——华为
-> 有大量闭源驱动和 vendor patch，自编内核会卡在开机 logo。编译仅用于生成
-> `Module.symvers`（符号 CRC 表），以便编译与平板内核匹配的 `.ko` 模块。
 
 ---
 
 ## 8.（可选）关闭 SELinux
 
-平板内核禁用了 SELinux 运行时开关（`CONFIG_SECURITY_SELINUX_DEVELOP=n`），
-本仓库提供的内核模块可以绕过。
-
 ### 8.1 编译
 
 ```bash
 source env.sh && cd dby-w09-4.0
-kmake O=../output/kernel_build M=../selinux_module modules
+make O=../output/kernel_build M=../selinux_module modules
 ```
 
-产物：`../selinux_module/selinux_permissive.ko`
-
-> 模块通过 `init_utsname()->version` 中的时间戳匹配已知内核配置表。
-> 如果时间戳不在 `known_kernels[]` 中，insmod 会拒绝加载。
-> 添加新内核支持见[常见问题](#常见问题)。
+产物：`output/selinux_module/selinux_permissive.ko`
 
 ### 8.2 使用
 
-> **警告**: 此模块直接修改内核代码，有死机/重启风险。建议**重启平板后单独测试**，
-> 确认稳定后再搭配其他内核模块（如 vhci-hcd）使用。若 `echo 1` 后死机，
-> 长按**音量下 + 电源键**强制重启。
+> 模块直接 patch 内核代码，有死机风险。若 `echo 1` 后重启，长按音量下+电源强制重启即可恢复。
 
 ```bash
 # 推送并加载
