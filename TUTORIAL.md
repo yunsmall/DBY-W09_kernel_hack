@@ -316,21 +316,20 @@ python3 tools/setup_kernel_source.py
 
 mkdir -p output/kernel_build
 cp analysis/my_tablet_origin_config output/kernel_build/.config
-cd dby-w09-4.0
 
 # 以下三个配置必须改：
 # ① 关闭模块自动签名 — 避免调用华为 sign-kernel.sh
-scripts/config --file ../output/kernel_build/.config --disable MODULE_SIG_ALL
+dby-w09-4.0/scripts/config --file output/kernel_build/.config --disable MODULE_SIG_ALL
 # ② 关闭系统信任密钥环 — 避免引用不存在的 extract-cert
-scripts/config --file ../output/kernel_build/.config --disable SYSTEM_TRUSTED_KEYRING
+dby-w09-4.0/scripts/config --file output/kernel_build/.config --disable SYSTEM_TRUSTED_KEYRING
 # ③ 清空模块签名密钥路径
-scripts/config --file ../output/kernel_build/.config --set-str MODULE_SIG_KEY ""
+dby-w09-4.0/scripts/config --file output/kernel_build/.config --set-str MODULE_SIG_KEY ""
 
 # 补全新编译器引入的配置项（重要，不能跳过）
-make O=../output/kernel_build olddefconfig
+make -C dby-w09-4.0 O=../output/kernel_build olddefconfig
 
 # 编译（注意用 kmake，不是 make）
-kmake O=../output/kernel_build -j$(nproc)
+kmake -C dby-w09-4.0 O=../output/kernel_build -j$(nproc)
 ```
 
 产物：`output/kernel_build/vmlinux`（ELF）、`output/kernel_build/arch/arm64/boot/Image`（原始镜像）。
@@ -347,13 +346,12 @@ python3 tools/setup_kernel_source.py
 
 mkdir -p output/modules_build
 cp analysis/my_tablet_origin_config output/modules_build/.config
-cd dby-w09-4.0
 
 # 仅需关掉一个选项
-scripts/config --file ../output/modules_build/.config --disable MODULE_SIG_ALL
-make O=../output/modules_build olddefconfig
-make O=../output/modules_build modules_prepare
-make O=../output/modules_build modules -j$(nproc)
+dby-w09-4.0/scripts/config --file output/modules_build/.config --disable MODULE_SIG_ALL
+make -C dby-w09-4.0 O=../output/modules_build olddefconfig
+make -C dby-w09-4.0 O=../output/modules_build modules_prepare
+make -C dby-w09-4.0 O=../output/modules_build modules -j$(nproc)
 ```
 
 产物在 `dby-w09-4.0/` 下各子目录。
@@ -368,8 +366,8 @@ make O=../output/modules_build modules -j$(nproc)
 需要先完成 [7.3 仅编译模块](#s7-3) 的 `modules_prepare` 步骤。
 
 ```bash
-source env.sh && cd dby-w09-4.0
-make O=../output/modules_build M=../selinux_module modules
+source env.sh
+make -C dby-w09-4.0 O=../output/modules_build M=../selinux_module modules
 ```
 
 产物：`output/selinux_module/selinux_permissive.ko`

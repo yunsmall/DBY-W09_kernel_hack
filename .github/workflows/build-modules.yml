@@ -40,20 +40,18 @@ jobs:
 
           mkdir -p output/modules_build
           cp analysis/my_tablet_origin_config output/modules_build/.config
-          cd dby-w09-4.0
-          scripts/config --file ../output/modules_build/.config --disable MODULE_SIG_ALL
-          make O=../output/modules_build olddefconfig
-          make O=../output/modules_build modules_prepare -j$(nproc)
-          make O=../output/modules_build modules -j$(nproc)
+          dby-w09-4.0/scripts/config --file output/modules_build/.config --disable MODULE_SIG_ALL
+          make -C dby-w09-4.0 O=../output/modules_build olddefconfig
+          make -C dby-w09-4.0 O=../output/modules_build modules_prepare -j$(nproc)
+          make -C dby-w09-4.0 O=../output/modules_build modules -j$(nproc)
 
           # SELinux module
-          make O=../output/modules_build M=../selinux_module modules
+          make -C dby-w09-4.0 O=../output/modules_build M=../selinux_module modules
 
           # Install all modules to staging dir.
-          # INSTALL_MOD_PATH 是相对于 O= 目录，用绝对路径。
-          MODULES_DIR="$PWD/../output/modules_install"
+          MODULES_DIR="$PWD/output/modules_install"
           mkdir -p "$MODULES_DIR"
-          make O=../output/modules_build INSTALL_MOD_PATH="$MODULES_DIR" modules_install || true
+          make -C dby-w09-4.0 O=../output/modules_build INSTALL_MOD_PATH="$MODULES_DIR" modules_install || true
 
       - name: Package
         run: |
