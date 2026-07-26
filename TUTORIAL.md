@@ -7,24 +7,25 @@
 > Root 教程可参考 B 站 [BV1HLVa68EUv](https://www.bilibili.com/video/BV1HLVa68EUv)。
 
 > **不想自己 Patch？** 直接从 [Releases](https://github.com/yunsmall/DBY-W09_kernel_hack/releases)
-> 下载 `kernel_patched.gz`，跳到[第 5 步](#5-重新打包-bootimg)。
+> 下载 `kernel_patched.gz`，跳到[第 5 步](#s5)。
 
 ---
 
 ## 目录
 
-1. [准备工作](#1-准备工作)
-2. [从平板提取原版 boot.img](#2-从平板提取原版-bootimg)
-3. [解包 boot.img](#3-解包-bootimg)
-4. [Patch 内核](#4-patch-内核)
-5. [重新打包 boot.img](#5-重新打包-bootimg)
-6. [刷入平板并验证](#6-刷入平板并验证)
-7. [（可选）编译内核模块](#7-可选编译内核模块)
-8. [（可选）关闭 SELinux](#8-可选关闭-selinux)
-9. [恢复原版](#9-恢复原版)
+1. [准备工作](#s1)
+2. [从平板提取原版 boot.img](#s2)
+3. [解包 boot.img](#s3)
+4. [Patch 内核](#s4)
+5. [重新打包 boot.img](#s5)
+6. [刷入平板并验证](#s6)
+7. [（可选）编译内核 / 模块](#s7)
+8. [（可选）关闭 SELinux](#s8)
+9. [恢复原版](#s9)
 
 ---
 
+<a id="s1"></a>
 ## 1. 准备工作
 
 ### 1.1 克隆仓库
@@ -69,6 +70,7 @@ adb devices
 
 ---
 
+<a id="s2"></a>
 ## 2. 从平板提取原版 boot.img
 
 ```bash
@@ -84,6 +86,7 @@ adb shell cat /proc/kallsyms > stock/tablet_kallsyms
 
 ---
 
+<a id="s3"></a>
 ## 3. 解包 boot.img
 
 用 `unpackbootimg` 一键解包，同时它会输出所有需要的打包参数：
@@ -123,6 +126,7 @@ cp /tmp/unpacked/boot.img-dtb      stock/boot_extracted/dtb
 
 ---
 
+<a id="s4"></a>
 ## 4. Patch 内核
 
 patch 脚本通过 **kallsyms**（第 2 步已备份）精确定位每个 patch 点，
@@ -161,7 +165,7 @@ python3 tools/patch_mod_verify_sig.py stock/boot_extracted/kernel \
 ```
 
 > **如果时间戳不在配置中**，脚本会打印 WARNING。建议把时间戳和偏移加入
-> `tools/kernel_patches.json`（添加方式见 [常见问题](#常见问题)），方便下次直接用精确模式。
+> `tools/kernel_patches.json`（添加方式见 [常见问题](#s10)），方便下次直接用精确模式。
 
 ### 正常输出：
 
@@ -196,6 +200,7 @@ python3 tools/patch_mod_verify_sig.py stock/boot_extracted/kernel \
 
 ---
 
+<a id="s5"></a>
 ## 5. 重新打包 boot.img
 
 `unpackbootimg` 把每个参数都写成了单独文件，直接用 `cat` 读取即可：
@@ -234,6 +239,7 @@ python3 tools/verify_bootimg.py stock/boot.img output/kernel_patched_boot.img
 
 ---
 
+<a id="s6"></a>
 ## 6. 刷入平板并验证
 
 ```bash
@@ -269,9 +275,22 @@ dmesg | grep bypassed
 
 ---
 
-## 7.（可选）编译内核模块
+<a id="s7"></a>
+## 7.（可选）编译内核 / 模块
 
-如果内核提供的模块不够用，可以从源码编译 `.ko`。
+可以从源码编译 `.ko` 模块，也可以编译完整内核用于调试。
+
+> **注意：源码编译的完整内核不能刷入平板。** 华为有大量闭源驱动和 vendor
+> patch，自编内核刷入后会卡 logo。编译内核仅用于获取 `Module.symvers` 来编译
+> `.ko` 模块，或用于调试分析。
+
+编译完整内核与仅编译模块的区别：
+
+| | 完整内核 | 仅模块 |
+|---|---|---|
+| 命令 | `kmake`（GNU ld） | `make`（lld 即可） |
+| 构建目录 | `output/kernel_build` | `output/modules_build` |
+| 需关掉的 config | 3 个（见下方） | 1 个 |
 
 ### 7.1 安装交叉编译工具链
 
@@ -286,9 +305,10 @@ sudo apt install clang-22 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 export PATH="/usr/lib/llvm-22/bin:$PATH"
 ```
 
-### 7.2 编译
+### 7.2 编译完整内核（vmlinux）
 
-> 编译 `.ko` 用 `make`。如需编译完整 vmlinux，用 `kmake` 代替（定义在 `env.sh`）。
+完整内核有一些 MSM 驱动会产生 `R_AARCH64_ABS32` 重定位错误，lld 无法处理，
+需要用 GNU ld（`env.sh` 里定义的 `kmake`）。此外还要关闭几个会引用华为闭源脚本的配置项。
 
 ```bash
 source env.sh
@@ -297,29 +317,59 @@ python3 tools/setup_kernel_source.py
 mkdir -p output/kernel_build
 cp analysis/my_tablet_origin_config output/kernel_build/.config
 cd dby-w09-4.0
+
+# 以下三个配置必须改：
+# ① 关闭模块自动签名 — 避免调用华为 sign-kernel.sh
+scripts/config --file ../output/kernel_build/.config --disable MODULE_SIG_ALL
+# ② 关闭系统信任密钥环 — 避免引用不存在的 extract-cert
+scripts/config --file ../output/kernel_build/.config --disable SYSTEM_TRUSTED_KEYRING
+# ③ 清空模块签名密钥路径
+scripts/config --file ../output/kernel_build/.config --set-str MODULE_SIG_KEY ""
+
+# 补全新编译器引入的配置项（重要，不能跳过）
 make O=../output/kernel_build olddefconfig
 
-# 唯一必须改的选项：关闭模块自动签名
-# 平板内核 MODULE_SIG_ALL=y 会调用华为的 sign-kernel.sh，
-# 本地没有这个脚本，必须关掉。生成的 .ko 不带签名，
-# 刷了 patched 内核后可以正常加载。
-scripts/config --file ../output/kernel_build/.config --disable MODULE_SIG_ALL
+# 编译（注意用 kmake，不是 make）
+kmake O=../output/kernel_build -j$(nproc)
+```
 
-make O=../output/kernel_build modules_prepare
-make O=../output/kernel_build modules
+产物：`output/kernel_build/vmlinux`（ELF）、`output/kernel_build/arch/arm64/boot/Image`（原始镜像）。
+
+<a id="s7-3"></a>
+### 7.3 仅编译模块
+
+只编译 `.ko` 模块不需要 GNU ld，用普通 `make`（lld）即可。构建目录独立使用
+`output/modules_build`，避免和完整内核的构建产物混淆。
+
+```bash
+source env.sh
+python3 tools/setup_kernel_source.py
+
+mkdir -p output/modules_build
+cp analysis/my_tablet_origin_config output/modules_build/.config
+cd dby-w09-4.0
+
+# 仅需关掉一个选项
+scripts/config --file ../output/modules_build/.config --disable MODULE_SIG_ALL
+make O=../output/modules_build olddefconfig
+make O=../output/modules_build modules_prepare
+make O=../output/modules_build modules -j$(nproc)
 ```
 
 产物在 `dby-w09-4.0/` 下各子目录。
 
 ---
 
+<a id="s8"></a>
 ## 8.（可选）关闭 SELinux
 
 ### 8.1 编译
 
+需要先完成 [7.3 仅编译模块](#s7-3) 的 `modules_prepare` 步骤。
+
 ```bash
 source env.sh && cd dby-w09-4.0
-make O=../output/kernel_build M=../selinux_module modules
+make O=../output/modules_build M=../selinux_module modules
 ```
 
 产物：`output/selinux_module/selinux_permissive.ko`
@@ -345,6 +395,7 @@ adb shell su -c "rmmod selinux_permissive"
 
 ---
 
+<a id="s9"></a>
 ## 9. 恢复原版
 
 ```bash
@@ -355,6 +406,7 @@ fastboot reboot
 
 ---
 
+<a id="s10"></a>
 ## 常见问题
 
 **Q: 怎么在内核配置和模块里添加新内核支持？**
