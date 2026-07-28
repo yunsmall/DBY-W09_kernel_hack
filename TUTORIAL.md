@@ -134,8 +134,8 @@ patch 脚本通过 **kallsyms**（第 2 步已备份）精确定位每个 patch 
 
 ### 情况 A：内核时间戳在配置中（推荐）
 
-`tools/kernel_patches.json` 里记录了已知内核的精确偏移。如果时间戳匹配，
-加上 `--timestamp` 走精确模式，还会打品牌标记（`/proc/version` 显示 `BP` 而非 `#1`）。
+`tools/kernel_patches.json` 里记录了已知内核的精确偏移。支持的内核列表见 [README](README.md#目标内核)。
+如果时间戳匹配，加上 `--timestamp` 走精确模式，还会打品牌标记（`/proc/version` 显示 `BP` 而非 `#1`）。
 
 先从 `/proc/version` 获取时间戳（平板开机状态）：
 
@@ -155,8 +155,12 @@ python3 tools/patch_mod_verify_sig.py stock/boot_extracted/kernel \
 
 ### 情况 B：内核时间戳不在配置中
 
+> **不推荐对不在支持列表中的内核直接使用脚本 patch。**
+> 不同编译时间的内核可能存在内部偏移差异，一旦 patch 到错误位置，内核可能崩溃无法开机。
+> 如果你有未适配的内核需要支持，请提 [Issue](../../issues)。
+
 如果时间戳不在 `kernel_patches.json` 里，不加 `--timestamp` 即可。
-脚本仍然通过 kallsyms 精确定位（不依赖启发式搜索），只是不打品牌标记。
+脚本仍然通过 kallsyms 精确定位，只是不打品牌标记。
 
 ```bash
 python3 tools/patch_mod_verify_sig.py stock/boot_extracted/kernel \
@@ -164,8 +168,7 @@ python3 tools/patch_mod_verify_sig.py stock/boot_extracted/kernel \
     --kallsyms stock/tablet_kallsyms
 ```
 
-> **如果时间戳不在配置中**，脚本会打印 WARNING。建议把时间戳和偏移加入
-> `tools/kernel_patches.json`（添加方式见 [常见问题](#s10)），方便下次直接用精确模式。
+> **如果时间戳不在配置中**，脚本会打印 WARNING。请提 [Issue](../../issues) 附上内核版本和时间戳，我们会帮助适配。
 
 ### 正常输出：
 

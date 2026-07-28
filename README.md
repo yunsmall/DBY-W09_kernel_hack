@@ -9,12 +9,17 @@ Huawei MatePad 11 2021 (DBY-W09) HarmonyOS 4.2 / Linux 4.19.157-perf+
 
 ## 目标内核
 
+目前已适配以下编译时间的内核：
+
 ```
 Linux version 4.19.157-perf+ (HarmonyOS@localhost)
 #1 SMP PREEMPT Mon Jun 24 13:57:05 CST 2024
+#1 SMP PREEMPT Fri Aug 30 08:34:06 CST 2024
 ```
 
-> 不同编译时间的同一版本内核，patch 脚本通过 kallsyms 精确定位。
+> 脚本通过 kallsyms 精确定位，偏移配置在 `tools/kernel_patches.json`。
+
+**如果内核时间戳不在支持列表中，请不要直接用脚本 patch。** 不同编译时间的内核可能存在内部偏移差异，直接 patch 可能导致内核崩溃无法开机。如果你有未适配的内核需要支持，欢迎提 [Issue](../../issues)。
 
 ## 做了什么
 
