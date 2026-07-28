@@ -27,7 +27,7 @@
  *   5. convert_context()         入口 → MOV W0,WZR; RET
  *      策略重载时上下文转换 (magiskpolicy --live 触发此路径)。
  *
- *   6. security_sid_mls_copy()    +conf.mls_off → MOV W23, WZR
+ *   6. security_sid_mls_copy()    +conf.mls_off → MOV W22, WZR
  *      convert_context_handle_invalid_context 的第二份内联。
  *
  * 控制: /sys/kernel/selinux_permissive/selinux_permissive
@@ -56,7 +56,13 @@ static struct kernel_config known_kernels[] = {
 		.timestamp        = "Mon Jun 24 13:57:05 CST 2024",
 		.avc_denied_off   = 0x20,
 		.compute_sid_off  = 0x4AC,
-		.sid_mls_copy_off = 0x330,
+		.sid_mls_copy_off = 0x1AC,
+	},
+	{
+		.timestamp        = "Fri Aug 30 08:34:06 CST 2024",
+		.avc_denied_off   = 0x20,
+		.compute_sid_off  = 0x4AC,
+		.sid_mls_copy_off = 0x1AC,
 	},
 };
 
@@ -65,7 +71,7 @@ static struct kernel_config known_kernels[] = {
 #define INSN_DENY   0x12800180   /* MOV W0, #0xFFFFFFF3 */
 #define INSN_ALLOW  0x2A1F03E0   /* MOV W0, WZR          */
 #define INSN_W21_WZR 0x2A1F03F5  /* MOV W21, WZR         */
-#define INSN_W23_WZR 0x2A1F03F7  /* MOV W23, WZR         */
+#define INSN_W22_WZR 0x2A1F03F6  /* MOV W22, WZR         */
 #define PATCH_ENTRY  { 0x2A1F03E0, 0xD65F03C0 }  /* MOV W0,WZR; RET */
 
 /* ── Patch 点描述 ───────────────────────────────────────────────────── */
@@ -101,7 +107,7 @@ static struct patch_point patches[] = {
 	{ .name = "security_compute_sid", .insn_count = 1, .permissive = { INSN_W21_WZR } },
 	ENTRY_PATCH("convert_context"),
 	/* [6] security_sid_mls_copy — 偏移来自配置 */
-	{ .name = "security_sid_mls_copy", .insn_count = 1, .permissive = { INSN_W23_WZR } },
+	{ .name = "security_sid_mls_copy", .insn_count = 1, .permissive = { INSN_W22_WZR } },
 };
 
 /* ── Toggle ──────────────────────────────────────────────────────────── */

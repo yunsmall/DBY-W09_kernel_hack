@@ -282,6 +282,8 @@ def main():
         print(f"\n完成 → {args.output}  ({len(data):,} 字节, gzip 压缩, 原始 {raw_size:,} 字节)")
     else:
         print(f"\n完成 → {args.output}  ({len(data):,} 字节, 原始 Image)")
+    with open(args.output, 'wb') as f:
+        f.write(data)
 
 if __name__ == '__main__':
     main()
