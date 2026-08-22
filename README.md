@@ -45,6 +45,28 @@ CI 手动触发编译：[Actions](../../actions/workflows/build-modules.yml)，�
 
 本地编译见 [完整教程](TUTORIAL.md#7可选编译内核模块)。
 
+## 内核日志实时转发（kmsg_dump）
+
+调试内核崩溃时，平板没有 pstore/ramoops（无预留内存），netconsole 也被华为关闭
+（`CONFIG_NETCONSOLE=n`，无 netpoll 符号）。`kmsg_dump` 模块注册一个 console，
+把内核日志实时通过 **UDP** 转发到接收端，崩溃时用 panic notifier 尽力补发最后一段。
+
+```bash
+# 编译
+make -C dby-w09-4.0 O=../output/modules_build M=../kmsg_dump modules
+
+# 接收端（WSL/PC）先监听
+nc -u -l -p 6666
+
+# 平板加载（ip 填接收端 IP）
+insmod kmsg_dump.ko ip=192.168.1.6 port=6666
+# 可选：同时写本地文件（不传 path 则只发 UDP）
+insmod kmsg_dump.ko ip=192.168.1.6 port=6666 path=/data/crash_kmsg
+```
+
+日志流式输出到 `nc` 终端，崩溃前的所有内核输出（含 panic trace）都能看到。
+模块在中断/原子上下文放弃发送（避免死锁），进程上下文崩溃（如 usbip 驱动 Oops）可完整抓到。
+
 ## 目录
 
 ```
@@ -54,6 +76,7 @@ env.sh                   ← 内核编译环境
 .github/workflows/       ← CI（手动触发编译模块）
 tools/                   ← patch_mod_verify_sig.py, verify_bootimg.py, verify_patches.py, setup_kernel_source.py
 selinux_module/           ← SELinux permissive 模块
+kmsg_dump/               ← 内核日志 UDP 实时转发模块
 analysis/                ← 平板内核配置
 dby-w09-4.0/             ← 内核源码 (submodule → yunsmall/dby-w09-4.0 fork)
 ```
